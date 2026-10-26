@@ -2,17 +2,24 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const TOTAL_RESPONSE_BUDGET_MS = 4200;
+const SERPER_TIMEOUT_MS = 1600;
+const GEMINI_TIMEOUT_MS = 2700;
 
-const SYSTEM_PROMPT = [
-  "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
-  "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-  "Если не знаешь ответа, честно скажи об этом."
-].join(" ");
+function getSystemPrompt() {
+  const today = new Intl.DateTimeFormat("ru-RU", {
+    dateStyle: "full",
+    timeZone: "Europe/Moscow"
+  }).format(new Date());
+
+  return [
+    `Сегодняшняя дата: ${today} (идёт 2026 год).`,
+    "Ты — умный и точный голосовой помощник в навыке Яндекс Алисы.",
+    "Отвечай естественно, по-русски, кратко и по делу (1–3 предложения), чтобы ответ было удобно слушать.",
+    "Не используй Markdown, звёздочки, таблицы, списки с символами или воду.",
+    "Если переданы результаты поиска из интернета, ОБЯЗАТЕЛЬНО бери факты и даты из них. Никогда не говори, что 2026 год — это далёкое будущее."
+  ].join(" ");
+}
 
 function aliceResponse(text, endSession = false, history = []) {
   return {
@@ -27,6 +34,7 @@ function aliceResponse(text, endSession = false, history = []) {
 
 function fitAliceText(value) {
   const text = String(value ?? "")
+    .replace(/[*#_~`>|]/g, "")
     .replace(/[\r\n\t]+/g, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
@@ -45,8 +53,32 @@ function fitAliceText(value) {
   return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
 }
 
+// Запускаем поиск для всех содержательных вопросов, кроме простых реплик приветствия/прощания
 function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+  const clean = text.trim().toLowerCase();
+  if (clean.length < 4) return false;
+  if (/^(привет|здравствуй|алло|хай|спасибо|благодарю|пока|стоп|выход|хватит|да|нет|ок|понятно|ясно|кто ты|что ты умеешь)$/i.test(clean)) {
+    return false;
+  }
+  return true;
+}
+
+// Очищаем запрос от голосовых команд Алисе и добавляем 2026 год, если спрашивают про даты/релизы без года
+function buildSearchQuery(text) {
+  let q = text
+    .replace(/^(алиса|пожалуйста|найди|поищи|скажи|расскажи|подскажи|в интернете|мне|информацию|инфу|про|о том)\s+/gi, "")
+    .replace(/^(в интернете|мне|информацию|инфу|про|о том)\s+/gi, "")
+    .trim();
+
+  if (!q) q = text.trim();
+
+  const mentionsTimeOrRelease = /январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр|сегодня|сейчас|выход|релиз|новост|курс|погод|игр/i.test(q);
+  const hasYear = /\b20\d{2}\b/.test(q);
+
+  if (mentionsTimeOrRelease && !hasYear) {
+    q = `${q} 2026`;
+  }
+  return q;
 }
 
 function safeHistory(history) {
@@ -69,9 +101,11 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function searchWeb(query, timeoutMs) {
+async function searchWeb(rawQuery, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
+  if (!key || timeoutMs < 200) return "";
+
+  const query = buildSearchQuery(rawQuery);
 
   try {
     const { response, data } = await fetchJson(
@@ -79,10 +113,10 @@ async function searchWeb(query, timeoutMs) {
       {
         method: "POST",
         headers: {
-          "X-API-KEY": key,
+          "X-API-KEY": key.trim(),
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
+        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 5 })
       },
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
@@ -93,12 +127,12 @@ async function searchWeb(query, timeoutMs) {
     }
 
     const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
+      .slice(0, 5)
       .map((item, i) => {
         const title = String(item.title || "").slice(0, 180);
         const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
+        const date = item.date ? ` (${item.date})` : "";
+        return `${i + 1}. ${title}${date}: ${snippet}`.trim();
       });
 
     const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
@@ -124,7 +158,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }));
 
   const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    ? `Вопрос пользователя: ${text}\n\nСвежие результаты поиска Google (2026 год):\n${searchContext}\nОтветь на вопрос пользователя, опираясь на эти результаты поиска.`
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
@@ -134,14 +168,14 @@ async function askGemini(text, history, searchContext, timeoutMs) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": key
+        "x-goog-api-key": key.trim()
       },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        systemInstruction: { parts: [{ text: getSystemPrompt() }] },
         contents,
         generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
+          temperature: 0.3,
+          maxOutputTokens: 280
         }
       })
     },
@@ -165,9 +199,6 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (!answer) {
     if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
     throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
   }
   return answer;
 }
@@ -218,18 +249,21 @@ export default async function handler(req, res) {
     ));
   }
 
+  if (/^(хватит|стоп|выход|выйти)$/i.test(text)) {
+    return res.status(200).json(aliceResponse("До встречи!", true, []));
+  }
+
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 1800)));
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300))
     );
 
     const history = [
@@ -240,7 +274,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.message === "AbortError" ? { message: "TIME_BUDGET_EXHAUSTED" } : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
